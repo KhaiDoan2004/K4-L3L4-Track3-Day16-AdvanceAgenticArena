@@ -79,16 +79,76 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ xác thực trong tài liệu nội bộ để trả lời câu hỏi."
+            return report
+
+        valid_claims = []
+        has_contradiction = False
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if not text:
+                continue
+
+            # (1) Claim có xuất hiện nguyên văn trong các tài liệu đã đọc
+            if text in ctx.observed_text:
+                valid_claims.append(claim)
+                continue
+
+            # (2) Xử lý mâu thuẫn: tách câu ghép do mô hình nối bằng " và "
+            split_result = self._split_contradiction(text, ctx)
+            if split_result:
+                c1, c2 = split_result
+                valid_claims.extend([c1, c2])
+                has_contradiction = True
+            # (3) Ngược lại: claim hoàn toàn không có căn cứ -> bỏ đi
+
+        if not valid_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ xác thực trong tài liệu nội bộ để trả lời câu hỏi."
+            return report
+
+        if has_contradiction:
+            report["abstain"] = True
+
+        report["claims"] = valid_claims
+        cits = [c["doc_id"] for c in valid_claims if c.get("doc_id")]
+        report["citations"] = sorted(set(cits))
+        return report
+
+    def _split_contradiction(self, text: str, ctx) -> tuple[dict, dict] | None:
+        """Tách câu ghép tại vị trí ' và ' nếu cả 2 nửa thuộc 2 tài liệu khác nhau đã đọc."""
+        sep = " và "
+        start = 0
+        while True:
+            idx = text.find(sep, start)
+            if idx == -1:
+                break
+            part1 = text[:idx]
+            part2 = text[idx + len(sep):]
+            if part1 and part2 and (part1 in ctx.observed_text) and (part2 in ctx.observed_text):
+                doc1 = self._find_doc_id(part1, ctx)
+                doc2 = self._find_doc_id(part2, ctx)
+                if doc1 and doc2 and doc1 != doc2:
+                    return ({"text": part1, "doc_id": doc1}, {"text": part2, "doc_id": doc2})
+            start = idx + 1
+        return None
+
+    def _find_doc_id(self, part: str, ctx) -> str | None:
+        """Tìm mã doc_id đầu tiên chứa chuỗi part trong một dòng."""
+        if not getattr(ctx, "corpus", None) or not getattr(ctx.corpus, "docs", None):
+            return None
+        for doc in ctx.corpus.docs:
+            for line in doc.body.splitlines():
+                if part in line:
+                    return doc.doc_id
+        return None
